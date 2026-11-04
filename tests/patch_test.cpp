@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <GL/gl.h>
 #include <stdio.h>
+#include <share.h>
 #include <math.h>
 #include <string>
 
@@ -57,6 +58,12 @@ static int g_postSceneCalls;
 static void __fastcall CapPostScene(void*, void*) { ++g_postSceneCalls; }
 static float g_capVec[3]; static void* g_capThis;
 static void __fastcall CapVec(void* self, void*, const float* v) { g_capThis = self; memcpy(g_capVec, v, 12); }
+// Stand-in for iLowLevelGraphics::SetScissorRect (thiscall, const cRect2l&)
+static int g_capRect[4]; static int g_scissorCalls;
+static void __fastcall CapScissor(void*, void*, const int* r) { memcpy(g_capRect, r, sizeof(g_capRect)); ++g_scissorCalls; }
+// Stand-in for iPhysicsController::SetPidIntegralSize (thiscall, one int)
+static int g_capPidSize = -1; static void* g_capPidCtrl;
+static void __fastcall CapPidSize(void* ctrl, void*, int n) { g_capPidCtrl = ctrl; g_capPidSize = n; }
 
 // Stand-in for cSqScript::LoadCharBuffer: reads g_fakeFile into a buffer from the game's new[]
 static char g_gameDir[MAX_PATH];
@@ -139,10 +146,22 @@ static int TestRate()
 	return rate;
 }
 
+// Calls fn(arg) and reports whether it faulted (kept apart from functions with C++ objects)
+static bool Faults(void* fn, void* arg)
+{
+	__try { ((int (__cdecl*)(void*))fn)(arg); }
+	__except(EXCEPTION_EXECUTE_HANDLER) { return true; }
+	return false;
+}
+
 static std::string ReadLog()
 {
-	std::string s; FILE* f;
-	if(fopen_s(&f, "PenumbraUltrawide.log", "rb") == 0) { char b[4096]; size_t n; while((n = fread(b, 1, sizeof(b), f)) > 0) s.append(b, n); fclose(f); }
+	// Next to the exe (the proxy writes it beside itself; later tests change the current directory)
+	char path[MAX_PATH]; GetModuleFileNameA(NULL, path, MAX_PATH);
+	char* slash = strrchr(path, '\\'); strcpy_s(slash ? slash + 1 : path, MAX_PATH - (slash ? slash + 1 - path : 0), "PenumbraUltrawide.log");
+	// Shared: the proxy keeps the log open for writing (fopen_s would refuse it)
+	std::string s; FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+	if(f) { char b[4096]; size_t n; while((n = fread(b, 1, sizeof(b), f)) > 0) s.append(b, n); fclose(f); }
 	return s;
 }
 
@@ -191,13 +210,16 @@ int main(int argc, char** argv)
 	CHECK(dll != NULL, "proxy SDL_image.dll loads");
 	CHECK(dll && *(FARPROC*)0x6726F0 != sdlInit, "SDL_Init import hooked at DLL load (code still encrypted then)");
 	CHECK(*(u8*)0x4F4710 != 0xE9, "nothing patched before SDL_Init");
+	CHECK(!GetModuleHandleA("SDL_image_orig.dll"), "real SDL_image not loaded yet");
 	typedef int (__cdecl *SDL_Init_t)(unsigned);
 	(*(SDL_Init_t*)0x6726F0)(0);
 	CHECK(*(u8*)0x4F4710 == 0xE9, "first SDL_Init applies the patches");
+	CHECK(GetModuleHandleA("SDL_image_orig.dll") != NULL, "real SDL_image loaded at engine start (before the sound thread)");
 	{
 		std::string log = ReadLog();
-		CHECK(log.find("mismatch") == std::string::npos && log.find("Unexpected") == std::string::npos && log.find("skipped") == std::string::npos,
-			  "log reports no mismatched patch sites");
+		CHECK(log.find("Patching at engine start") != std::string::npos && log.find("game logic runs at") != std::string::npos &&
+			  log.find("mismatch") == std::string::npos && log.find("Unexpected") == std::string::npos && log.find("skipped") == std::string::npos,
+			  "log reports every part applied and no mismatched patch sites");
 	}
 	typedef void* (__cdecl *IMG_Load_t)(const char*);
 	IMG_Load_t imgLoad = (IMG_Load_t)GetProcAddress(dll, "IMG_Load");
@@ -380,6 +402,8 @@ int main(int argc, char** argv)
 			{ "maps\\level01_cells.hps" }, { "maps\\level04_messhall.hps" }, { "maps\\level11_infirmary.hps" },
 			{ "maps\\level19_chemical_laboratory.hps" }, { "interfaces\\18_terminal_gui.hps" }, { "interfaces\\19_terminal_gui.hps" },
 			{ "maps\\level00_tutorial.hps" }, { "maps\\level12_mental_realm.hps" }, { "maps\\level15_outside.hps" },
+			{ "maps\\level10_machine_room.hps",
+			  "if(GetGameEntityActive(\"rod02\") && GetWheelAngle(\"rod02\") >= 36.0f) PlayerTurnRod(\"rod02\", 0, 1);" },
 		};
 		sprintf_s(files[0].expect, "fDiff < -%.6ff || fDiff > %.6ff)", 0.4 * 60 / rate, 0.4 * 60 / rate);
 		sprintf_s(files[1].expect, "glCount %% %d == 0)", rate);
@@ -416,7 +440,8 @@ int main(int argc, char** argv)
 				  "level19 barricade push and arm steps all rewritten");
 		}
 		std::string log = ReadLog();
-		CHECK(log.find("script ") == std::string::npos, "every script edit matched the expected number of times");
+		CHECK(log.find("adjusted maps/level10_machine_room.hps") != std::string::npos && log.find("script ") == std::string::npos,
+			  "every script edit matched the expected number of times");
 
 		// Untouched script: same buffer back
 		char path[MAX_PATH]; sprintf_s(path, "%s\\maps\\level02_vents.hps", g_gameDir);
@@ -430,6 +455,23 @@ int main(int argc, char** argv)
 		double slope = **(double**)(0x4D7E0D + 2);
 		CHECK(inDll(*(DWORD*)(0x4D7E0D + 2)) && fabs(slope + 0.15 * 60 / rate) < 1e-9, "slope threshold scaled (%.4f)", slope);
 		CHECK(*(u8*)(0x459507 + 1) == (u8)ticks(20), "door PID window %d ticks", *(u8*)(0x459507 + 1));
+
+		// Joint controllers from .ent files: integral window scaled at the loader's call
+		{
+			PutJmp(0x528FD0, &CapPidSize);
+			typedef void (__fastcall *SetPid_t)(void*, void*, int);
+			SetPid_t setPid = (SetPid_t)CallTarget(0x509537);
+			int ctrl = 0, got40, got1, got0, espBefore, espAfter;
+			__asm mov espBefore, esp
+			setPid(&ctrl, 0, 40); got40 = g_capPidSize;
+			setPid(&ctrl, 0, 1);  got1 = g_capPidSize;
+			setPid(&ctrl, 0, 0);  got0 = g_capPidSize;
+			__asm mov espAfter, esp
+			CHECK(inDll((DWORD)setPid) && g_capPidCtrl == &ctrl && got40 == ticks(40) && got1 == ticks(1) && got0 == 0 && espBefore == espAfter,
+				  "entity controller PID window scaled (40 -> %d, 1 -> %d, 0 stays %d), stack balanced", got40, got1, got0);
+		}
+		CHECK(*(u8*)0x4AD1B4 == ticks(10) && *(u8*)0x4AD1CC == ticks(10) && *(u8*)0x4AD1DB == ticks(10) && *(u8*)0x4AD1EE == ticks(10),
+			  "grab move/rotate PID windows %d ticks", *(u8*)0x4AD1DB);
 
 		void* probe = (void*)CallTarget(0x4D73CA);
 		float sumSq = 4.0f, reach = 0;
@@ -694,10 +736,54 @@ int main(int argc, char** argv)
 		CHECK(cCalls == 0 && Near(l, -OFF) && Near(r, 800 + OFF), "terminal projection spans x %.2f..%.2f", l, r);
 		CHECK(glGetError() == GL_NO_ERROR && !glIsEnabled(GL_SCISSOR_TEST) && cc[0] == 0.25f && cc[2] == 0.75f,
 			  "terminal side-bar clear leaves GL state as it was");
+
+		// Terminal clip boxes (list boxes, windows) follow the centred layout. The game builds
+		// them stretched: a list at virtual x 469.5, width 260 -> 2018, 1118 at 3440 wide.
+		// Centred (4:3 area 1920 px from x 760) it is 1886..2511.
+		{
+			static void* fakeVt[0x40] = {}; fakeVt[0xD8 / 4] = (void*)&CapScissor;
+			void* savedVt = *(void**)g_gfx; *(void***)g_gfx = fakeVt;
+			typedef void (__fastcall *Scissor_t)(void*, void*, const int*);
+			Scissor_t scissor = (Scissor_t)CallTarget(0x4F8DAF);
+			const int stretched[4] = { 2018, 100, 1118, 200 };
+			g_scissorCalls = 0;
+			scissor(g_gfx, 0, stretched);
+			int cx = g_capRect[0], cw = g_capRect[2];
+			bool centred = cx >= 1885 && cx <= 1887 && cw >= 624 && cw <= 626 && g_capRect[1] == 100 && g_capRect[3] == 200;
+			// Once the set's clip regions are drawn, boxes pass through unchanged (3D GUI sets)
+			PutJmp(0x4F9A80, &CapPostScene);
+			g_postSceneCalls = 0;
+			((Post_t)CallTarget(0x4FA152))((void*)1, 0);
+			scissor(g_gfx, 0, stretched);
+			CHECK(inDll((DWORD)scissor) && *(u8*)0x4F8DB4 == 0x90 && centred && g_postSceneCalls == 1 && g_scissorCalls == 2 &&
+				  g_capRect[0] == 2018 && g_capRect[2] == 1118,
+				  "terminal clip box centred (x %d w %d), unchanged after the set's clip regions", cx, cw);
+			*(void**)g_gfx = savedVt;
+		}
 		g_postSceneCalls = 0;
 		((Post_t)CallTarget(0x4EE01B))((void*)1, 0);
 		CHECK(g_postSceneCalls == 1, "post-scene draw (after 3D) still reaches the game");
 		DropGLContext();
+	}
+
+	// 11b. Original-game bug: effect slots always create their mutex (it was skipped because
+	// threading is switched on only after the slots exist)
+	CHECK(*(WORD*)0x5A970E == 0x9090 && *(u8*)0x5A9707 == 0x38 && CallTarget(0x5A9710) == 0x623C34 &&
+		  ReadLog().find("Environmental Audio crash (original game bug) fixed") != std::string::npos,
+		  "effect slot constructor always calls SDL_CreateMutex");
+
+	// 12. Crash report: a fault in a DLL from the game folder is logged with module+offset and
+	// the code addresses on the stack (the user's startup crash: SDL_mutexP given a bad mutex)
+	{
+		void* mutexP = sdl ? (void*)GetProcAddress(sdl, "SDL_mutexP") : NULL;
+		bool faulted = mutexP && Faults(mutexP, (void*)0x10);
+		std::string log = ReadLog();
+		size_t at = log.find("Crash C0000005 on thread");
+		CHECK(faulted && at != std::string::npos && log.find("SDL.dll+28C09", at) != std::string::npos &&
+			  log.find("eax=00000010", at) != std::string::npos && log.find("[esp+", at) != std::string::npos,
+			  "crash in SDL_mutexP logged as SDL.dll+28C09 with registers and stack");
+		bool again = Faults((void*)0x12345678, NULL);
+		CHECK(again && ReadLog().find("12345678 (address") == std::string::npos, "faults outside the game's modules are not reported");
 	}
 
 done:

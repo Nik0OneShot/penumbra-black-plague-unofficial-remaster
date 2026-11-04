@@ -23,6 +23,10 @@ screen, about 1.8× too wide at 21:9. With the fix installed:
 - Things at the far left and right of a wide view no longer turn black (stencil-shadow method
   chosen from a box that only covered a 4:3 view, rooms behind doorways just off screen).
   On very wide screens (about 2.6:1 and up, e.g. 32:9), fog culling no longer hides everything.
+- **Environmental Audio crash (a bug in the original game):** with Environmental Audio
+  turned on, the game could crash at start-up or on exit, depending on leftover memory
+  contents. Its effect slots were created before threading was switched on, so they never
+  got the lock the sound thread then uses. They now always get one.
 - **High framerate:** the game's logic (player, camera, physics, scripts) normally updates
   60 times a second, and frames are only drawn after an update, so it never looks smoother
   than 60 FPS. The fix runs the logic at your monitor's refresh rate (or the `LogicRate` you
@@ -43,12 +47,19 @@ these so the game plays as it does at 60 Hz:
   objects and flares; debris from broken objects and doors.
 - **Enemies:** path following; stair stepping; mesh smoothing; how the worm's body trails its
   head; how long footstep sounds stay audible to them.
-- **Physics:** how long props take to fall asleep after coming to rest; swing-door braking.
+- **Physics:** how long props take to fall asleep after coming to rest; swing-door braking;
+  the controllers on valves, wheels, levers, drawers and doors (their resistance and the
+  pull that drives them open or shut remember the last fraction of a second, which was
+  counted in updates); turning a held object.
 - **Level scripts:** the cell's electrical cord snapping (level 1), the flare check in the mess
   hall, the living head in the infirmary, the robot arm in the chemical lab, the typewriter text
   on the terminals in levels 18 and 19, and the one-off pushes on the tutorial shelf, the worm's
   door, the ice bridge and the lab barricade. These are adjusted as the scripts load; the files
   on disk are untouched.
+- **Machine room gate:** the rod you jam into the gate's lock only breaks it when turned to
+  its limit, but the padlock's collision box stops it a few degrees short. At 60 Hz contacts
+  are soft enough for the rod to sink in and reach the limit; at higher rates they are
+  stiffer, so the lock now breaks once the rod is most of the way there.
 
 The rate is set by `LogicRate` in `PenumbraUltrawide.ini`: `0` matches your monitor (default),
 and `60` gives the original behaviour. With "Limit FPS" on (the default), the game draws one
@@ -79,7 +90,8 @@ fix in its place. Then set the resolution in Options > Graphics, or edit
 `Documents\Penumbra\Black Plague\settings.cfg` (`<Screen Width="3440" Height="1440" .../>`).
 
 Each launch writes `PenumbraUltrawide.log` next to `Penumbra.exe`, saying whether the patches
-applied. `PenumbraUltrawide.ini` there turns each part on or off.
+applied. If the game crashes, the log also records where (module, registers and call stack),
+which is worth including in a bug report. `PenumbraUltrawide.ini` there turns each part on or off.
 
 ## Uninstall
 

@@ -38,6 +38,14 @@ namespace A {
 	const DWORD RetDrawTexture  = 0x0045CC2C;	// cGraphicsHelper::DrawTexture
 	const DWORD RetIntroDraw    = 0x00469446;	// cIntroStory::OnDraw
 	const DWORD RetGuiSetRender = 0x004FA150;	// cGuiSet::Render, 2D branch (computer terminals)
+	// cGuiSet::Render then draws its clip regions (both 2D and 3D sets); SetClipArea turns each
+	// region into a scissor box, stretching the virtual width over the whole screen
+	const DWORD GuiRenderClipCall = 0x004FA152;	// call RenderClipRegions (thiscall, no args)
+	const DWORD GuiRenderClip     = 0x004F9A80;
+	const DWORD GuiScissorCall    = 0x004F8DAF;	// call [eax+0D8h] = SetScissorRect(const cRect2l&)
+	const DWORD ScissorSlot       = 0xD8;
+	const DWORD GfxVtable         = 0x00688358;	// cLowLevelGraphicsSDL
+	const DWORD SetScissorRect    = 0x0055DE20;
 
 	// cGui::SendMouseMove(absPos, relPos), fed from cButtonHandler with the mouse's absolute
 	// position (stretched screen space) while a terminal is open
@@ -96,6 +104,11 @@ namespace A {
 	const DWORD FrustumPlanes    = 0x2D0;	// cPlanef[6] (a, b, c, d, normal): left, right, bottom, top, near, far
 	const DWORD FrustumSphereRadius = 0x378;
 	const DWORD PortalBV         = 0x90;	// cPortal::mBV; cPortal::mlId at +4
+
+	// OALWrapper effect slot constructor: cmp byte [owner+18h], 0 (threaded?); ...; je past
+	// "call SDL_CreateMutex; mov [esi+20h], eax"
+	const DWORD EfxSlotMutexIf   = 0x005A9707;
+	const DWORD SdlCreateMutex   = 0x00623C34;	// import thunk
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -196,6 +209,38 @@ static void ClearSideBars(int W, int H, float off, float width)
 	glColorMask(mask[0], mask[1], mask[2], mask[3]);
 }
 
+// Terminal clip regions (list boxes, scrolling text, windows) become scissor boxes in screen
+// pixels, computed as if the layout were stretched over the whole width. While a GUI set's 2D
+// render is centred (from its ortho call until its clip regions are drawn), map those boxes
+// into the centred area. 3D GUI sets never get the centred ortho, so they are left alone.
+struct GuiClip { bool on; float off, span; };	// virtual units: centring offset, visible width
+static GuiClip g_guiClip;
+
+typedef void (__fastcall *SetScissor_t)(void*, void*, const int*);
+static void __fastcall Call_GuiScissor(void* gfx, void* edx, const int* rect)
+{
+	SetScissor_t fn = *(SetScissor_t*)(*(u8**)gfx + A::ScissorSlot);
+	const u8* g = (const u8*)gfx;
+	const float W = (float)*(const int*)(g + 4), vx = VirtualWidth(g);
+	if(g_guiClip.on && g_guiClip.span > 0 && W > 0 && vx > 0)
+	{
+		float l = (rect[0] * vx / W + g_guiClip.off) / g_guiClip.span * W;
+		float r = ((rect[0] + rect[2]) * vx / W + g_guiClip.off) / g_guiClip.span * W;
+		int box[4] = { (int)floorf(l), rect[1], 0, rect[3] };
+		box[2] = (int)ceilf(r) - box[0];
+		fn(gfx, edx, box);
+		return;
+	}
+	fn(gfx, edx, rect);
+}
+
+typedef void (__fastcall *GuiRenderClip_t)(void*, void*);
+static void __fastcall Call_GuiRenderClip(void* set, void* edx)
+{
+	((GuiRenderClip_t)A::GuiRenderClip)(set, edx);
+	g_guiClip.on = false;
+}
+
 // 2D projection: centre the 800x600 layout for the UI passes (HUD/menus, textures, intro,
 // terminals), leave post effects alone. The centring is computed from the size the caller
 // asks for, so a GUI set with its own canvas size is centred correctly too.
@@ -203,6 +248,7 @@ static void __fastcall Hook_SetOrtho(void* gfx, void* edx, const float* size, fl
 {
 	g_lowGfx = (u8*)gfx;
 	DWORD ret = (DWORD)_ReturnAddress();
+	if(ret == A::RetGuiSetRender) g_guiClip.on = false;
 	Fit f;
 	if((ret == A::RetDrawAll || ret == A::RetDrawTexture || ret == A::RetIntroDraw || ret == A::RetGuiSetRender)
 	   && GetFit((u8*)gfx, f) && size[1] > 0)
@@ -211,7 +257,13 @@ static void __fastcall Hook_SetOrtho(void* gfx, void* edx, const float* size, fl
 		float off = (size[1] * (float)W / (float)H - size[0]) * 0.5f;
 		if(off > 0.25f)
 		{
-			if(ret == A::RetGuiSetRender && !g_world3DDrawn) ClearSideBars(W, H, off, size[0]);
+			if(ret == A::RetGuiSetRender)
+			{
+				if(!g_world3DDrawn) ClearSideBars(W, H, off, size[0]);
+				g_guiClip.off = off;
+				g_guiClip.span = size[0] + 2 * off;
+				g_guiClip.on = true;
+			}
 			glMatrixMode(GL_PROJECTION);
 			glLoadIdentity();
 			glOrtho(-off, size[0] + off, size[1], 0, afMin, afMax);
@@ -556,6 +608,10 @@ static bool VerifyGame()
 	static const u8 orthoCallEdx[] = { 0xFF, 0x52, 0x7C };
 	ok &= Expect(A::RetGuiSetRender - 3, orthoCallEdx, 3, "GuiSet ortho call");
 	ok &= ExpectCall(A::GuiMouseMoveCall, A::GuiSendMouseMove, "terminal mouse move");
+	ok &= ExpectCall(A::GuiRenderClipCall, A::GuiRenderClip, "terminal clip regions");
+	static const u8 scissorCall[] = { 0x8B, 0x06, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0x90, 0xD8, 0x00, 0x00, 0x00 };
+	ok &= Expect(A::GuiScissorCall - 9, scissorCall, sizeof(scissorCall), "terminal scissor call")
+		&& ExpectDword(A::GfxVtable + A::ScissorSlot, A::SetScissorRect, "SetScissorRect vtable slot");
 	ok &= ExpectCall(A::PostSceneDrawAfter3D, A::PostSceneDraw, "post-scene draw after 3D")
 		&& ExpectCall(A::PostSceneDrawNo3D, A::PostSceneDraw, "post-scene draw without 3D");
 	ok &= Expect(A::DrawLong, drawLongHead, sizeof(drawLongHead), "DrawGfxObject head");
@@ -645,6 +701,10 @@ static void ApplyPatches()
 		for(DWORD c : A::LetterboxCalls) RedirectCall(c, &Call_DrawTextureStretch);
 		RedirectCall(A::ScreenCopyDrawCall, &Call_DrawTextureStretch);
 		RedirectCall(A::GuiMouseMoveCall, &Call_GuiMouseMove);
+		RedirectCall(A::GuiRenderClipCall, &Call_GuiRenderClip);
+		u8 scissor[6] = { 0xE8, 0, 0, 0, 0, 0x90 };
+		*(DWORD*)(scissor + 1) = (DWORD)&Call_GuiScissor - (A::GuiScissorCall + 5);
+		Write(A::GuiScissorCall, scissor, sizeof(scissor));
 		RedirectCall(A::PostSceneDrawAfter3D, &Call_PostSceneDrawAfter3D);
 		RedirectCall(A::PostSceneDrawNo3D, &Call_PostSceneDrawNo3D);
 		Log("  2D layout pillarboxed (incl. terminals), overlays full width%s", tramp ? "" : " (overlay detour FAILED)");
@@ -669,6 +729,20 @@ static void ApplyPatches()
 	g_portalMargin = (float)CfgInt("DoorwayMargin", 2);
 	if(g_portalMargin > 0) RedirectCall(A::PortalTestCall, &Call_PortalTest);
 	Log("  wide-view shadow and fog culling fixed; doorway margin %.0f m", g_portalMargin);
+
+	// Bug in the original game, with Environmental Audio on: the effect slots are built before
+	// their manager switches threading on, so they never create their mutex. The slot updater
+	// thread then locks, and shutdown frees, whatever that memory held, which crashes whenever
+	// it isn't zero. Always create the mutex (it is only used once threading is on).
+	static const u8 slotMutexIf[] = { 0x38, 0x48, 0x18, 0x89, 0x4C, 0x24, 0x10, 0x74, 0x08 };
+	if(Expect(A::EfxSlotMutexIf, slotMutexIf, sizeof(slotMutexIf), "effect slot mutex") &&
+	   ExpectCall(A::EfxSlotMutexIf + 9, A::SdlCreateMutex, "effect slot SDL_CreateMutex"))
+	{
+		static const u8 nops[] = { 0x90, 0x90 };
+		Write(A::EfxSlotMutexIf + 7, nops, sizeof(nops));
+		Log("  Environmental Audio crash (original game bug) fixed");
+	}
+
 	int rate = ChooseLogicRate();
 	if(rate != 60)
 	{
@@ -711,6 +785,69 @@ FORWARD(IMG_isXCF, 27)
 FORWARD(IMG_isXPM, 28)
 FORWARD(IMG_isXV, 29)
 
+//////////////////////////////////////////////////////////////////////////
+// Crash report
+//
+// If the game crashes, write where (module + offset), the registers and the code addresses on
+// the crashing thread's stack to the log, so a report can be traced. Only faults in modules
+// from the game's folder are reported, at most three, and nothing is handled here.
+
+static void* g_crashHandler;
+
+static bool ModuleOf(DWORD addr, HMODULE& mod, char* path)
+{
+	if(!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+						   (LPCSTR)addr, &mod)) return false;
+	return GetModuleFileNameA(mod, path, MAX_PATH) != 0;
+}
+
+static void Describe(DWORD addr, char* out, size_t n)
+{
+	HMODULE mod; char path[MAX_PATH];
+	if(!ModuleOf(addr, mod, path)) { _snprintf_s(out, n, _TRUNCATE, "%08X", addr); return; }
+	const char* name = strrchr(path, '\\');
+	_snprintf_s(out, n, _TRUNCATE, "%s+%X (%08X)", name ? name + 1 : path, addr - (DWORD)mod, addr);
+}
+
+static bool IsImageCode(DWORD addr)
+{
+	MEMORY_BASIC_INFORMATION mbi;
+	if(addr < 0x10000 || !VirtualQuery((void*)addr, &mbi, sizeof(mbi))) return false;
+	return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+		(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+
+static LONG CALLBACK CrashReport(EXCEPTION_POINTERS* ep)
+{
+	const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+	const DWORD code = er->ExceptionCode;
+	if(code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+	   code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO) return EXCEPTION_CONTINUE_SEARCH;
+	const CONTEXT* c = ep->ContextRecord;
+	HMODULE mod; char path[MAX_PATH];
+	if(!ModuleOf(c->Eip, mod, path) || _strnicmp(path, g_dir, strlen(g_dir)) != 0) return EXCEPTION_CONTINUE_SEARCH;
+	static volatile LONG reports;
+	if(InterlockedIncrement(&reports) > 3) return EXCEPTION_CONTINUE_SEARCH;
+
+	char where[MAX_PATH + 32];
+	Describe(c->Eip, where, sizeof(where));
+	Log("Crash %08X on thread %u at %s (address %08X)", code, GetCurrentThreadId(), where,
+		er->NumberParameters >= 2 ? (DWORD)er->ExceptionInformation[1] : 0);
+	Log("  eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X ebp=%08X esp=%08X",
+		c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+	const DWORD* sp = (const DWORD*)c->Esp;
+	const DWORD* top = (const DWORD*)((NT_TIB*)NtCurrentTeb())->StackBase;
+	int shown = 0;
+	for(const DWORD* p = sp; p < top && p < sp + 2048 && shown < 40; ++p)
+	{
+		if(!IsImageCode(*p)) continue;
+		Describe(*p, where, sizeof(where));
+		Log("  [esp+%03X] %s", (DWORD)((p - sp) * 4), where);
+		++shown;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // Patch once, as early as possible: some fixes change values the game stores while building
 // its objects. The game's first SDL_Init call (engine start-up, before any game object
 // exists) is the preferred moment; the first IMG_Load is the fallback.
@@ -719,9 +856,27 @@ static void EnsurePatched(const char* when)
 	static bool done;
 	if(done) return;
 	done = true;
-	Log("Patching at %s", when);
+	g_crashHandler = AddVectoredExceptionHandler(0, CrashReport);	// after the Steam stub has run
+	Log("Patching at %s (main thread %u)", when, GetCurrentThreadId());
 	if(CfgInt("Enabled", 1)) ApplyPatches();
 	else Log("Disabled in PenumbraUltrawide.ini");
+}
+
+// The real SDL_image. The game only imports IMG_Load, which this DLL implements itself, so
+// Windows doesn't load the original with the game. Load it at engine start-up, before the
+// sound system starts its thread, as it would have been without the proxy.
+typedef void* (__cdecl *IMG_Load_t)(const char*);
+static IMG_Load_t g_imgLoad;
+
+static bool LoadRealImageLib()
+{
+	if(g_imgLoad) return true;
+	char path[MAX_PATH];
+	_snprintf_s(path, sizeof(path), _TRUNCATE, "%sSDL_image_orig.dll", g_dir);
+	HMODULE orig = LoadLibraryA(path);
+	if(orig) g_imgLoad = (IMG_Load_t)GetProcAddress(orig, "IMG_Load");
+	if(!g_imgLoad) Log("Could not load IMG_Load from %s", path);
+	return g_imgLoad != NULL;
 }
 
 const DWORD IatSDLInit = 0x006726F0;	// Penumbra.exe import slot for SDL_Init
@@ -730,27 +885,14 @@ static SDL_Init_t g_sdlInit;
 
 static int __cdecl Hook_SDLInit(unsigned flags)
 {
+	LoadRealImageLib();
 	EnsurePatched("engine start");
 	return g_sdlInit(flags);
 }
 
-typedef void* (__cdecl *IMG_Load_t)(const char*);
-static IMG_Load_t g_imgLoad;
-
 extern "C" void* __cdecl IMG_Load(const char* file)
 {
-	if(!g_imgLoad)
-	{
-		char path[MAX_PATH];
-		_snprintf_s(path, sizeof(path), _TRUNCATE, "%sSDL_image_orig.dll", g_dir);
-		HMODULE orig = LoadLibraryA(path);
-		if(orig) g_imgLoad = (IMG_Load_t)GetProcAddress(orig, "IMG_Load");
-		if(!g_imgLoad)
-		{
-			Log("Could not load IMG_Load from %s", path);
-			return NULL;
-		}
-	}
+	if(!LoadRealImageLib()) return NULL;
 	EnsurePatched("first image load");
 	return g_imgLoad(file);
 }
@@ -777,6 +919,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 		HMODULE sdl = GetModuleHandleA("SDL.dll");
 		g_sdlInit = sdl ? (SDL_Init_t)GetProcAddress(sdl, "SDL_Init") : NULL;
 		if(g_sdlInit && SameBytes(IatSDLInit, &g_sdlInit, 4)) WriteDword(IatSDLInit, (DWORD)&Hook_SDLInit);
+	}
+	else if(reason == DLL_PROCESS_DETACH && g_crashHandler)
+	{
+		RemoveVectoredExceptionHandler(g_crashHandler);
+		g_crashHandler = NULL;
 	}
 	return TRUE;
 }

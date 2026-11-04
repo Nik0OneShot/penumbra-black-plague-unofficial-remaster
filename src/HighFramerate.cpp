@@ -33,6 +33,8 @@ namespace H {
 	// cGameSwingDoor: Stop controller SetPidIntegralSize(20)
 	const DWORD DoorPidSize      = 0x00459507;	// push 14h
 	const DWORD SetPidIntegralSize = 0x00528FD0;
+	// cEntityLoader_Object: every joint controller in an .ent file -> SetPidIntegralSize(IntegralSize)
+	const DWORD EntityPidSizeCall = 0x00509537;
 
 	// Newton.dll import used for auto-freezing bodies (frames counted per physics step)
 	const DWORD IatSetFreezeTreshold = 0x006724CC;
@@ -125,6 +127,13 @@ static const TickImmediate g_tickImmediates[] = {
 	{ 0x004AAB04, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay (sideways)" },
 	{ 0x004AAB7D, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay (yaw)" },
 	{ 0x004AAC55, { 0xC7, 0x46, 0x58 }, 3, 4, 20, "move: brake delay (pitch)" },
+	// cPlayerState_Grab constructor: push 10 = PID error history (errors, then time steps) for
+	// the move and rotate controllers. The rotate one has an integral term while turning a
+	// held object.
+	{ 0x004AD1B3, { 0x6A }, 1, 1, 10, "grab: move PID samples" },
+	{ 0x004AD1CB, { 0x6A }, 1, 1, 10, "grab: move PID samples" },
+	{ 0x004AD1DA, { 0x6A }, 1, 1, 10, "grab: rotate PID samples" },
+	{ 0x004AD1ED, { 0x6A }, 1, 1, 10, "grab: rotate PID samples" },
 };
 
 // A float pushed as an immediate.
@@ -236,6 +245,14 @@ static void BuildScriptEdits()
 		  "AddBodyForce(\"beam01_beamShape\", \"world\", 0, 0, " + OneTick(40000) + ");", 1 },
 		{ "level19_chemical_laboratory.hps", "AddBodyForce(\"beam01_beamShape\", \"world\", 0, 0, -40000);",
 		  "AddBodyForce(\"beam01_beamShape\", \"world\", 0, 0, " + OneTick(-40000) + ");", 1 },
+
+		// Machine room: the rod in the gate lock breaks it at its 45 degree limit (44 counts),
+		// but the static padlock's collider stops the rod at 38.5-41 degrees. At 60 Hz the soft
+		// contacts let the rod sink far enough in; at higher rates they are stiffer and it stops
+		// short. Break the lock once the rod is past 36 degrees (it is swapped for a loose rod
+		// posed at 30 degrees either way). Inactive after it fires, so saves are fine.
+		{ "level10_machine_room.hps", "void OnUpdate()\r\n{\t\r\n}",
+		  "void OnUpdate()\r\n{\r\n\tif(GetGameEntityActive(\"rod02\") && GetWheelAngle(\"rod02\") >= 36.0f) PlayerTurnRod(\"rod02\", 0, 1);\r\n}", 1 },
 	};
 }
 
@@ -294,6 +311,15 @@ static char* __fastcall Call_LoadScript(void* script, void* edx, const void* nam
 
 //////////////////////////////////////////////////////////////////////////
 // Engine
+
+// Joint controllers from .ent files (valve and wheel resistance, levers, drawers and doors that
+// drive themselves open or shut) are PIDs whose integral sums the error over the last
+// IntegralSize ticks. Scale it so the window covers the same time (0 stays 0).
+typedef void (__fastcall *SetPidIntegralSize_t)(void*, void*, int);
+static void __fastcall Call_SetPidIntegralSize(void* controller, void* edx, int size)
+{
+	((SetPidIntegralSize_t)H::SetPidIntegralSize)(controller, edx, size > 0 ? ScaleTicks(size) : size);
+}
 
 // Character "don't slide on gentle slopes" test: the vertical speed it compares is built from
 // one tick of gravity, so the threshold scales with the step.
@@ -493,6 +519,7 @@ bool VerifyHighFramerate()
 	static const u8 doorPid[] = { 0x6A, 0x14, 0x8B, 0xCE, 0x89, 0x5E, 0x40 };
 	ok &= Expect(H::DoorPidSize, doorPid, sizeof(doorPid), "door PID size") &&
 		ExpectCall(H::DoorPidSize + 7, H::SetPidIntegralSize, "door SetPidIntegralSize");
+	ok &= ExpectCall(H::EntityPidSizeCall, H::SetPidIntegralSize, "entity controller SetPidIntegralSize");
 
 	HMODULE newton = GetModuleHandleA("Newton.dll");
 	FARPROC setFreeze = newton ? GetProcAddress(newton, "NewtonBodySetFreezeTreshold") : NULL;
@@ -529,6 +556,7 @@ void ApplyHighFramerate(int rate)
 
 	u8 doorPid = (u8)ScaleTicks(20);
 	Write(H::DoorPidSize + 1, &doorPid, 1);
+	RedirectCall(H::EntityPidSizeCall, &Call_SetPidIntegralSize);
 
 	g_setFreezeTreshold = *(SetFreezeTreshold_t*)H::IatSetFreezeTreshold;
 	WriteDword(H::IatSetFreezeTreshold, (DWORD)&Hook_SetFreezeTreshold);
